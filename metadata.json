@@ -1,5 +1,5 @@
 {
-  "name": "Investment OS",
+  "name": "量化投资时序研判系统",
   "description": "An AI-powered Investment Operating System with a Knowledge Graph, Market State Machine, and Multi-Agent Reasoning system.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

@@ -7,10 +7,127 @@ export const STATES = [
   "REVERSAL"            // 反转期
 ];
 
+import { ProbabilisticTransition } from '../../types';
+
 export interface TransitionExplanation {
   nextState: string;
   scoreCard: Record<string, number>;
   arbitrationLog: string[];
+  probabilisticTransitions?: ProbabilisticTransition[];
+}
+
+/**
+ * Computes a standard Markov-based dynamic transition probability layout for all states
+ */
+export function calculateTransitionProbabilities(
+  currentState: string,
+  bullishWeight: number,
+  bearishWeight: number,
+  signals: Record<string, any>
+): ProbabilisticTransition[] {
+  const state = (currentState || "ACCUMULATION").toUpperCase();
+  const probabilities: Record<string, number> = {
+    "ACCUMULATION": 0,
+    "BREAKOUT": 0,
+    "TREND_EXPANSION": 0,
+    "DISTRIBUTION": 0,
+    "DECLINE": 0
+  };
+
+  // Base transition probability distributions with standard state-machine bias
+  switch (state) {
+    case "ACCUMULATION":
+      if (signals.volume_breakout && !signals.breakdown) {
+        probabilities["BREAKOUT"] = 70;
+        probabilities["ACCUMULATION"] = 25;
+        probabilities["DECLINE"] = 5;
+      } else if (signals.breakdown) {
+        probabilities["DECLINE"] = 60;
+        probabilities["ACCUMULATION"] = 40;
+      } else {
+        probabilities["ACCUMULATION"] = 85;
+        probabilities["BREAKOUT"] = 10;
+        probabilities["DECLINE"] = 5;
+      }
+      break;
+
+    case "BREAKOUT":
+      if (signals.breakdown) {
+        probabilities["DECLINE"] = 80;
+        probabilities["BREAKOUT"] = 10;
+        probabilities["ACCUMULATION"] = 10;
+      } else {
+        probabilities["TREND_EXPANSION"] = 65;
+        probabilities["BREAKOUT"] = 25;
+        probabilities["DECLINE"] = 10;
+      }
+      break;
+
+    case "TREND_EXPANSION":
+      if (signals.breakdown) {
+        probabilities["DECLINE"] = 85;
+        probabilities["TREND_EXPANSION"] = 15;
+      } else if (signals.fund_flow_negative) {
+        probabilities["DISTRIBUTION"] = 75;
+        probabilities["TREND_EXPANSION"] = 20;
+        probabilities["DECLINE"] = 5;
+      } else {
+        probabilities["TREND_EXPANSION"] = 80;
+        probabilities["DISTRIBUTION"] = 15;
+        probabilities["DECLINE"] = 5;
+      }
+      break;
+
+    case "DISTRIBUTION":
+      if (signals.breakdown) {
+        probabilities["DECLINE"] = 90;
+        probabilities["DISTRIBUTION"] = 10;
+      } else if (signals.volume_breakout && !signals.fund_flow_negative) {
+        probabilities["TREND_EXPANSION"] = 60;
+        probabilities["DISTRIBUTION"] = 35;
+        probabilities["DECLINE"] = 5;
+      } else {
+        probabilities["DISTRIBUTION"] = 70;
+        probabilities["DECLINE"] = 25;
+        probabilities["TREND_EXPANSION"] = 5;
+      }
+      break;
+
+    case "DECLINE":
+    default:
+      if (signals.volume_breakout && !signals.breakdown) {
+        probabilities["ACCUMULATION"] = 65;
+        probabilities["DECLINE"] = 30;
+        probabilities["BREAKOUT"] = 5;
+      } else {
+        probabilities["DECLINE"] = 85;
+        probabilities["ACCUMULATION"] = 15;
+      }
+      break;
+  }
+
+  // Adjust probabilities dynamically using raw bull/bear indicators
+  const adjBull = bullishWeight / 100;
+  const adjBear = bearishWeight / 100;
+
+  if (probabilities["BREAKOUT"] !== undefined) {
+    probabilities["BREAKOUT"] = Math.max(0, probabilities["BREAKOUT"] + (adjBull * 15) - (adjBear * 10));
+  }
+  if (probabilities["TREND_EXPANSION"] !== undefined) {
+    probabilities["TREND_EXPANSION"] = Math.max(0, probabilities["TREND_EXPANSION"] + (adjBull * 20) - (adjBear * 15));
+  }
+  if (probabilities["DECLINE"] !== undefined) {
+    probabilities["DECLINE"] = Math.max(0, probabilities["DECLINE"] + (adjBear * 25) - (adjBull * 15));
+  }
+
+  // Smooth & Normalize to 100%
+  const total = Object.values(probabilities).reduce((sum, v) => sum + v, 0);
+  return Object.entries(probabilities).map(([st, val]) => {
+    return {
+      state: st,
+      probability: parseFloat(((val / total) * 100).toFixed(1))
+    };
+  }).sort((a, b) => b.probability - a.probability);
 }
 
 /**
@@ -32,13 +149,13 @@ export function transitionWithArbiter(currentState: string, signals: Record<stri
   if (signals.breakdown) bearishWeight += 50;
   if (signals.fund_flow_negative) bearishWeight += 35;
 
-  logs.push(`[状态判定机] 计算综合加权：多头指标得分 [${bullishWeight}]，空头指标得分 [${bearishWeight}]。`);
+  logs.push(`[状态预测机] 计算综合加权：多头得分 [${bullishWeight}]，空头得分 [${bearishWeight}]。`);
 
   let nextState = state;
 
   switch (state) {
     case "ACCUMULATION":
-      // Requiement for BREAKOUT: strong bullish score >= 40 and no bearish breakdown veto
+      // Requirement for BREAKOUT: strong bullish score >= 40 and no bearish breakdown veto
       if (signals.volume_breakout) {
         if (signals.breakdown) {
           logs.push(`[冲突仲裁] 检测到突破信号存在，但伴随关键支撑破位(breakdown Veto)，判定为“震荡假突破”，维持原有 [ACCUMULATION] 状态不变。`);
@@ -60,8 +177,6 @@ export function transitionWithArbiter(currentState: string, signals: Record<stri
       break;
 
     case "TREND_EXPANSION":
-      // If breakdown occurs, crash straight to Decline.
-      // If fund flow represents systematic delivery, transition to high-level spot distribution.
       if (signals.breakdown) {
         nextState = "DECLINE";
         logs.push(`[状态转移] 剧烈跌破趋势均线支撑！直接转向深幅调整 [DECLINE]。`);
@@ -74,7 +189,7 @@ export function transitionWithArbiter(currentState: string, signals: Record<stri
     case "DISTRIBUTION":
       if (signals.breakdown) {
         nextState = "DECLINE";
-        logs.push(`[状态转移] 高位震荡彻底泄洪，向下跌破核心密集成交区，转入崩溃通道 [DECLINE]。`);
+        logs.push(`[状态转移] 高位震荡彻底泄洪，向下跌破核心密密集区，转入崩溃通道 [DECLINE]。`);
       } else if (signals.trend_confirmed && !signals.fund_flow_negative && bullishWeight >= 50) {
         nextState = "TREND_EXPANSION";
         logs.push(`[状态转移] 筹码完成次级重洗，主力资金回流，向上修补重拾主升走势 [TREND_EXPANSION]。`);
@@ -99,13 +214,16 @@ export function transitionWithArbiter(currentState: string, signals: Record<stri
 
   // Double check self loops safety parameters
   if (nextState === state) {
-    logs.push(`[稳态判定] 无高级阶段跃迁跳转条件触发。维持现有稳态: "${state}"。`);
+    logs.push(`[稳态稳健] 无最高优先跳转转移触发，回归主循环。维持现有状态: "${state}"。`);
   }
+
+  const probabilisticTransitions = calculateTransitionProbabilities(state, bullishWeight, bearishWeight, signals);
 
   return {
     nextState,
     scoreCard: { bullishWeight, bearishWeight },
-    arbitrationLog: logs
+    arbitrationLog: logs,
+    probabilisticTransitions
   };
 }
 

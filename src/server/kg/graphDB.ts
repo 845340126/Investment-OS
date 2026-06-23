@@ -127,8 +127,8 @@ export class GraphDB {
    * Loads signals and states associated with a specific stock.
    * Leverages pre-built system indices for O(1) performance.
    */
-  public load_stock_context(symbol: string): Array<{ type: string; value: any; timestamp: string }> {
-    const context: Array<{ type: string; value: any; timestamp: string }> = [];
+  public load_stock_context(symbol: string): Array<{ type: string; label?: string; value: any; properties?: Record<string, any>; timestamp: string }> {
+    const context: Array<{ type: string; label?: string; value: any; properties?: Record<string, any>; timestamp: string }> = [];
 
     const stockNode = this.stockSymbolMap.get(symbol.toUpperCase());
     if (!stockNode) return [];
@@ -147,6 +147,29 @@ export class GraphDB {
           context.push({
             type: 'MARKET_REGIME',
             value: targetNode.properties.state,
+            timestamp: targetNode.properties.timestamp || new Date().toISOString()
+          });
+
+          // Also get nested custom CausalFactor nodes linked through this MarketRegime node
+          const nestedRels = this.relationshipsBySourceMap.get(targetNode.id) || [];
+          for (const nestedRel of nestedRels) {
+            const nestedNode = this.nodeByIdMap.get(nestedRel.target);
+            if (nestedNode && nestedNode.type === 'CausalFactor') {
+              context.push({
+                type: 'CausalFactor',
+                label: nestedNode.label,
+                value: nestedNode.properties.value,
+                properties: nestedNode.properties,
+                timestamp: nestedNode.properties.timestamp || new Date().toISOString()
+              });
+            }
+          }
+        } else if (targetNode.type === 'FeedBack') {
+          context.push({
+            type: 'FEEDBACK',
+            label: targetNode.label,
+            value: targetNode.properties.status,
+            properties: targetNode.properties,
             timestamp: targetNode.properties.timestamp || new Date().toISOString()
           });
         }
@@ -240,6 +263,59 @@ export class GraphDB {
   }
 
   /**
+   * Write causal macro factor connected to a target node
+   */
+  public write_causal_factor(symbol: string, label: string, factorType: string, targetNodeId: string): string {
+    const factorId = `causal_${factorType}_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`;
+    const timestamp = new Date().toISOString();
+
+    this.nodes.push({
+      id: factorId,
+      label,
+      type: 'CausalFactor',
+      properties: { factor_type: factorType, value: label, timestamp, symbol }
+    });
+
+    this.relationships.push({
+      id: `rel_${targetNodeId}_caused_by_${factorId}`,
+      source: targetNodeId,
+      target: factorId,
+      type: 'CAUSED_BY',
+      properties: { timestamp }
+    });
+
+    this.save();
+    return factorId;
+  }
+
+  /**
+   * Write accuracy verification or performance feedback log to stock
+   */
+  public write_feedback(symbol: string, status: string, notes: string): string {
+    const stockId = this.mergeStock(symbol);
+    const feedbackId = `feedback_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`;
+    const timestamp = new Date().toISOString();
+
+    this.nodes.push({
+      id: feedbackId,
+      label: `历史反馈: ${status}`,
+      type: 'FeedBack',
+      properties: { status, notes, timestamp }
+    });
+
+    this.relationships.push({
+      id: `rel_${stockId}_feedback_${feedbackId}`,
+      source: stockId,
+      target: feedbackId,
+      type: 'HAS_FEEDBACK',
+      properties: { timestamp }
+    });
+
+    this.save();
+    return feedbackId;
+  }
+
+  /**
    * Seeds realistic demo data for the first view with rich chronological sequence items
    */
   public seedDemoData() {
@@ -299,6 +375,40 @@ export class GraphDB {
         properties: { timestamp: new Date(Date.now() - 3600000 * 24 * 5).toISOString() }
       });
 
+      // Seeding causal macro vectors linked to states and signals (Explains WHY)
+      let macroFactorLabel = "";
+      let macroFactorType = "";
+      if (idx === 0) {
+        macroFactorLabel = "降准政策落地 / 高端消费高壁垒溢价";
+        macroFactorType = "MONETARY_POLICY";
+      } else if (idx === 1) {
+        macroFactorLabel = "地产行业信用筑底 / 融资链条阶段性承压";
+        macroFactorType = "INDUSTRY_DEBT_RISK";
+      } else if (idx === 2) {
+        macroFactorLabel = "新能源固态电池突破 / 全球碳减排补贴利好";
+        macroFactorType = "GLOBAL_TRADE";
+      } else {
+        macroFactorLabel = "长期国债收益率走低 / 核心高股息资产重估";
+        macroFactorType = "INTEREST_RATE";
+      }
+
+      const macroId = `causal_${s.sym}_macro`;
+      this.nodes.push({
+        id: macroId,
+        label: macroFactorLabel,
+        type: 'CausalFactor',
+        properties: { factor_type: macroFactorType, value: macroFactorLabel, timestamp: new Date(Date.now() - 3600000 * 24 * 5).toISOString(), symbol: s.sym }
+      });
+
+      // Macro causally triggers state
+      this.relationships.push({
+        id: `rel_${regimeId}_caused_by_${macroId}`,
+        source: regimeId,
+        target: macroId,
+        type: 'CAUSED_BY',
+        properties: { timestamp: new Date(Date.now() - 3600000 * 24 * 5).toISOString() }
+      });
+
       // Historical signals
       const sigs = [
         { type: 'volume_breakout', val: s.sym === '300750' || s.sym === '600519' },
@@ -320,10 +430,41 @@ export class GraphDB {
           target: sigId,
           type: 'HAS_SIGNAL'
         });
+
+        // Flow/Technical signal caused by our macro environment node
+        this.relationships.push({
+          id: `rel_${sigId}_caused_by_${macroId}`,
+          source: sigId,
+          target: macroId,
+          type: 'CAUSED_BY'
+        });
+      });
+
+      // Write historical feedback block
+      const prevFeedbackId = `feedback_${s.sym}_init`;
+      const accuracyScore = idx !== 1 ? "完全一致 (92% 置信度)" : "稍有偏离 (防诱多预警修正)";
+      const feedbackNotes = idx !== 1 
+        ? "机器状态机诊断结果与资产实际走势完美拟合，AI 独立复核稳定。" 
+        : "系统于突破阶段侦测到大资金异动撤离，成功阻断交易员高位追涨，挽回假突破回撤。";
+
+      this.nodes.push({
+        id: prevFeedbackId,
+        label: `反馈: ${accuracyScore}`,
+        type: 'FeedBack',
+        properties: { status: accuracyScore, notes: feedbackNotes, timestamp: new Date(Date.now() - 3600000 * 24 * 1).toISOString() }
+      });
+
+      this.relationships.push({
+        id: `rel_${stockId}_feedback_${prevFeedbackId}`,
+        source: stockId,
+        target: prevFeedbackId,
+        type: 'HAS_FEEDBACK',
+        properties: { timestamp: new Date(Date.now() - 3600000 * 24 * 1).toISOString() }
       });
     });
 
     this.save();
-    console.log("Successfully seeded demo data with historical time-series for Knowledge Graph!");
+    console.log("Successfully seeded demo data with historical causal chains & temporal feedback for Knowledge Graph!");
   }
 }
+
