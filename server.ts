@@ -47,8 +47,18 @@ async function startServer() {
     }
 
     try {
+      // Resolve the actual Chinese company name using live tencent API
+      const info = await broker.fetchMarketIndicators(symbol);
+      const companyName = info.name || `${symbol.toUpperCase()} 证券`;
+      
+      // Update or merge the stock properties with correct name details
+      db.mergeStock(symbol, companyName);
+
       // Execute the decision cycle
-      const result = await engine.run(symbol, query || 'Inference State', market_data);
+      const result = await engine.run(symbol, query || 'Inference State', {
+        ...market_data,
+        name: companyName
+      });
       res.json(result);
     } catch (e) {
       console.error("Engine execution failure in server", e);
@@ -61,6 +71,8 @@ async function startServer() {
     const { symbol } = req.params;
     try {
       const metrics = await broker.fetchMarketIndicators(symbol);
+      // Register or update the target stock node in the graph database in real-time
+      db.mergeStock(symbol, metrics.name);
       res.json(metrics);
     } catch (e) {
       res.status(500).json({ error: (e as Error).message });

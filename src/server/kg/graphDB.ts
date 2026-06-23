@@ -2,10 +2,43 @@ import fs from 'fs';
 import path from 'path';
 import { GraphNode, GraphRelationship } from '../../types';
 
+/**
+ * Interface representing a future standard Neo4j Graph DB Connection driver
+ * This keeps the application modular and ready for real enterprise deployment.
+ */
+export interface INeo4jDriver {
+  connect(): Promise<boolean>;
+  runCypher(query: string, params?: Record<string, any>): Promise<any>;
+  close(): Promise<void>;
+}
+
+export class DummyNeo4jConnector implements INeo4jDriver {
+  private uri: string;
+  constructor(uri: string = "neo4j://localhost:7687") {
+    this.uri = uri;
+  }
+  async connect() {
+    console.log(`[PROXIED] Initializing connection to Neo4j database instance at: ${this.uri}...`);
+    return true;
+  }
+  async runCypher(query: string, params?: Record<string, any>) {
+    console.log(`[CYPHER EXECUTE]: ${query} with params ${JSON.stringify(params)}`);
+    return { records: [] };
+  }
+  async close() {
+    console.log("[PROXIED] Closed session with Neo4j driver cleanly.");
+  }
+}
+
 export class GraphDB {
   private filePath: string;
   private nodes: GraphNode[] = [];
   private relationships: GraphRelationship[] = [];
+  
+  // Real-time index lookups to maintain O(1) searches as nodes grow to thousands
+  private nodeByIdMap: Map<string, GraphNode> = new Map();
+  private stockSymbolMap: Map<string, GraphNode> = new Map();
+  private relationshipsBySourceMap: Map<string, GraphRelationship[]> = new Map();
 
   constructor() {
     this.filePath = path.join(process.cwd(), 'data', 'graph_db.json');
@@ -23,12 +56,32 @@ export class GraphDB {
     }
   }
 
+  private rebuidIndices() {
+    this.nodeByIdMap.clear();
+    this.stockSymbolMap.clear();
+    this.relationshipsBySourceMap.clear();
+
+    for (const node of this.nodes) {
+      this.nodeByIdMap.set(node.id, node);
+      if (node.type === 'Stock' && node.properties.symbol) {
+        this.stockSymbolMap.set(node.properties.symbol.toUpperCase(), node);
+      }
+    }
+
+    for (const rel of this.relationships) {
+      const list = this.relationshipsBySourceMap.get(rel.source) || [];
+      list.push(rel);
+      this.relationshipsBySourceMap.set(rel.source, list);
+    }
+  }
+
   private load() {
     try {
       if (fs.existsSync(this.filePath)) {
         const data = JSON.parse(fs.readFileSync(this.filePath, 'utf-8'));
         this.nodes = data.nodes || [];
         this.relationships = data.relationships || [];
+        this.rebuidIndices();
       }
     } catch (e) {
       console.error("Failed to load Knowledge Graph from disk, starting fresh.", e);
@@ -43,6 +96,7 @@ export class GraphDB {
         nodes: this.nodes,
         relationships: this.relationships
       }, null, 2), 'utf-8');
+      this.rebuidIndices();
     } catch (e) {
       console.error("Failed to save Knowledge Graph to disk", e);
     }
@@ -56,19 +110,32 @@ export class GraphDB {
   }
 
   /**
+   * Pagination Query Helper to support millions of nodes without overloading client
+   */
+  public getNodesPaginated(page: number = 1, pageSize: number = 20) {
+    const start = (page - 1) * pageSize;
+    return {
+      items: this.nodes.slice(start, start + pageSize),
+      totalCount: this.nodes.length,
+      page,
+      pageSize,
+      totalPages: Math.ceil(this.nodes.length / pageSize)
+    };
+  }
+
+  /**
    * Loads signals and states associated with a specific stock.
+   * Leverages pre-built system indices for O(1) performance.
    */
   public load_stock_context(symbol: string): Array<{ type: string; value: any; timestamp: string }> {
     const context: Array<{ type: string; value: any; timestamp: string }> = [];
 
-    // Find the stock node
-    const stockNode = this.nodes.find(n => n.type === 'Stock' && n.properties.symbol === symbol.toUpperCase());
+    const stockNode = this.stockSymbolMap.get(symbol.toUpperCase());
     if (!stockNode) return [];
 
-    // Find all signals or regimes connected to this stock
-    const rels = this.relationships.filter(r => r.source === stockNode.id);
+    const rels = this.relationshipsBySourceMap.get(stockNode.id) || [];
     for (const rel of rels) {
-      const targetNode = this.nodes.find(n => n.id === rel.target);
+      const targetNode = this.nodeByIdMap.get(rel.target);
       if (targetNode) {
         if (targetNode.type === 'Signal') {
           context.push({
@@ -90,21 +157,28 @@ export class GraphDB {
   }
 
   /**
-   * Add/merge a Stock node
+   * Add/merge a Stock node with support for updating company names and labels
    */
-  public mergeStock(symbol: string, companyName: string): string {
+  public mergeStock(symbol: string, companyName?: string): string {
     const upperSym = symbol.toUpperCase();
-    const existing = this.nodes.find(n => n.type === 'Stock' && n.properties.symbol === upperSym);
+    const existing = this.stockSymbolMap.get(upperSym);
+    const defaultName = companyName || `${upperSym} 证券`;
+    
     if (existing) {
+      if (companyName && (!existing.properties.company_name || existing.properties.company_name.includes('Corporation') || existing.properties.company_name.includes('证券'))) {
+        existing.properties.company_name = companyName;
+        existing.label = `${upperSym} (${companyName})`;
+        this.save();
+      }
       return existing.id;
     }
 
     const id = `stock_${upperSym}_${Date.now()}`;
     this.nodes.push({
       id,
-      label: upperSym,
+      label: companyName ? `${upperSym} (${companyName})` : upperSym,
       type: 'Stock',
-      properties: { symbol: upperSym, company_name: companyName, timestamp: new Date().toISOString() }
+      properties: { symbol: upperSym, company_name: defaultName, timestamp: new Date().toISOString() }
     });
     this.save();
     return id;
@@ -114,7 +188,7 @@ export class GraphDB {
    * Write signal event and tie to Stock node
    */
   public write_signal(symbol: string, signalType: string, value: any): string {
-    const stockId = this.mergeStock(symbol, `${symbol} Corporation`);
+    const stockId = this.mergeStock(symbol);
     const signalId = `sig_${signalType}_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`;
 
     const timestamp = new Date().toISOString();
@@ -142,7 +216,7 @@ export class GraphDB {
    * Write regime state and tie to Stock node
    */
   public write_market_state(symbol: string, state: string): string {
-    const stockId = this.mergeStock(symbol, `${symbol} Corporation`);
+    const stockId = this.mergeStock(symbol);
     const regimeId = `regime_${state}_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`;
 
     const timestamp = new Date().toISOString();
@@ -166,26 +240,45 @@ export class GraphDB {
   }
 
   /**
-   * Seeds realistic demo data for the first view
+   * Seeds realistic demo data for the first view with rich chronological sequence items
    */
   public seedDemoData() {
     this.nodes = [];
     this.relationships = [];
 
     const stocks = [
-      { sym: 'AAPL', name: 'Apple Inc.' },
-      { sym: 'TSLA', name: 'Tesla Inc.' },
-      { sym: 'NVDA', name: 'Nvidia Corp.' },
-      { sym: 'BTC', name: 'Bitcoin Network' }
+      { sym: '600519', name: '贵州茅台' },
+      { sym: '000002', name: '万科A' },
+      { sym: '300750', name: '宁德时代' },
+      { sym: '601318', name: '中国平安' }
     ];
 
     stocks.forEach((s, idx) => {
       const stockId = `stock_${s.sym}`;
+      
+      // High-Fidelity Chronological Series Data representing 5 historical days of prices
+      const priceSeries = idx === 0 
+        ? [1680.0, 1695.5, 1710.2, 1705.0, 1720.5] // Moutai style
+        : (idx === 1 
+          ? [9.5, 9.2, 9.0, 8.6, 8.45] // Vanke style
+          : (idx === 2 
+            ? [175.4, 178.2, 180.1, 182.5, 184.8] // CATL
+            : [41.2, 41.5, 41.8, 42.0, 42.15])); // Ping An
+
+      const volumeSeries = [1200000, 1300000, 1420000, 1650000, 1800000];
+
       this.nodes.push({
         id: stockId,
-        label: s.sym,
+        label: `${s.sym} (${s.name})`,
         type: 'Stock',
-        properties: { symbol: s.sym, company_name: s.name, timestamp: new Date().toISOString() }
+        properties: { 
+          symbol: s.sym, 
+          company_name: s.name, 
+          timestamp: new Date().toISOString(),
+          historical_prices: priceSeries,
+          historical_volumes: volumeSeries,
+          time_window: '5D_Chronological'
+        }
       });
 
       // Historical market state
@@ -208,8 +301,8 @@ export class GraphDB {
 
       // Historical signals
       const sigs = [
-        { type: 'volume_breakout', val: s.sym === 'NVDA' || s.sym === 'BTC' },
-        { type: 'trend_confirmed', val: true }
+        { type: 'volume_breakout', val: s.sym === '300750' || s.sym === '600519' },
+        { type: 'trend_confirmed', val: s.sym !== '000002' }
       ];
 
       sigs.forEach((sig, sIdx) => {
@@ -231,6 +324,6 @@ export class GraphDB {
     });
 
     this.save();
-    console.log("Successfully seeded demo data for Knowledge Graph!");
+    console.log("Successfully seeded demo data with historical time-series for Knowledge Graph!");
   }
 }

@@ -26,14 +26,68 @@ import {
 } from 'lucide-react';
 import { GraphNode, GraphRelationship, MarketData, InvestmentRunResult } from './types';
 
+const LOCALIZATION_MAP: Record<string, string> = {
+  // States
+  'ACCUMULATION': '主力吸筹期',
+  'BREAKOUT': '放量突破区',
+  'TREND_EXPANSION': '趋势主升浪',
+  'DISTRIBUTION': '高位派发期',
+  'DECLINE': '下行衰退期',
+
+  // Signals
+  'volume_breakout': '技术量能突破',
+  'trend_confirmed': '均线金叉支撑',
+  'fund_flow_negative': '资金大单流出',
+  'breakdown': '破位关键支撑'
+};
+
+const getLocalizedNodeLabel = (node: any) => {
+  if (!node) return '';
+  if (node.type === 'Stock') {
+    return node.label;
+  }
+  if (node.type === 'MarketRegime') {
+    const s = node.properties?.state || '';
+    return LOCALIZATION_MAP[s] || `周期阶段: ${s}`;
+  }
+  if (node.type === 'Signal') {
+    const t = node.properties?.type || '';
+    const localizedType = LOCALIZATION_MAP[t] || t;
+    const v = node.properties?.value;
+    const strVal = v === true ? '是' : (v === false ? '否' : JSON.stringify(v));
+    return `${localizedType}: ${strVal}`;
+  }
+  return node.label;
+};
+
 export default function App() {
   // Config & Inputs state
-  const [symbol, setSymbol] = useState<string>('AAPL');
+  const [symbol, setSymbol] = useState<string>('600519');
+  const [stockName, setStockName] = useState<string>('贵州茅台');
+  const [recentStocks, setRecentStocks] = useState<Array<{ symbol: string; name: string }>>(() => {
+    try {
+      const saved = localStorage.getItem('recent_stocks');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return parsed;
+        }
+      }
+    } catch (e) {
+      console.warn('Failed to load recent stocks', e);
+    }
+    return [
+      { symbol: '600519', name: '贵州茅台' },
+      { symbol: '000002', name: '万科A' },
+      { symbol: '300750', name: '宁德时代' },
+      { symbol: '601318', name: '中国平安' }
+    ];
+  });
   const [query, setQuery] = useState<string>('当前是否已成功放量突破阻力位？');
-  const [price, setPrice] = useState<number>(178.50);
-  const [volume, setVolume] = useState<number>(1800000);
+  const [price, setPrice] = useState<number>(1720.50);
+  const [volume, setVolume] = useState<number>(1530000);
   const [priceTrend, setPriceTrend] = useState<'up' | 'down' | 'flat'>('up');
-  const [institutionalFlow, setInstitutionalFlow] = useState<number>(12.8);
+  const [institutionalFlow, setInstitutionalFlow] = useState<number>(45.2);
   const [breakdown, setBreakdown] = useState<boolean>(false);
 
   // Application Data state
@@ -41,6 +95,7 @@ export default function App() {
     nodes: [],
     relationships: []
   });
+  const [filterActiveOnly, setFilterActiveOnly] = useState<boolean>(false);
   const [runResult, setRunResult] = useState<InvestmentRunResult | null>(null);
   const [executionLogs, setExecutionLogs] = useState<string[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
@@ -66,7 +121,7 @@ export default function App() {
   // Fetch graph & indices on startup
   useEffect(() => {
     fetchGraph();
-    fetchBrokerData('AAPL');
+    fetchBrokerData('600519');
   }, []);
 
   const fetchGraph = async () => {
@@ -85,12 +140,28 @@ export default function App() {
     try {
       const res = await fetch(`/api/broker/indicators/${targetSymbol}`);
       if (res.ok) {
-        const data: MarketData = await res.json();
+        const data: MarketData & { name?: string } = await res.json();
         setPrice(data.price);
         setVolume(data.volume);
         setPriceTrend(data.price_trend);
         setInstitutionalFlow(data.institutional_flow);
         setBreakdown(data.breakdown);
+        if (data.name) {
+          setStockName(data.name);
+          
+          // Dynamically append newly synced symbol to recent list
+          const cleanSymbol = targetSymbol.toUpperCase().trim();
+          setRecentStocks((prev) => {
+            const filtered = prev.filter(x => x.symbol !== cleanSymbol);
+            const updated = [{ symbol: cleanSymbol, name: data.name || cleanSymbol }, ...filtered].slice(0, 5);
+            try {
+              localStorage.setItem('recent_stocks', JSON.stringify(updated));
+            } catch (err) {}
+            return updated;
+          });
+        }
+        // Force the visual Knowledge Graph network to query newest additions
+        await fetchGraph();
       }
     } catch (e) {
       console.error("Failed to load indicators from broker", e);
@@ -165,12 +236,10 @@ export default function App() {
   };
 
   // SVG Helper layout coordinates logic for visual Graph
-  const computeGraphPositions = () => {
-    const w = 620;
-    const h = 250;
-    const stockNodes = graphData.nodes.filter(n => n.type === 'Stock');
-    const signalNodes = graphData.nodes.filter(n => n.type === 'Signal');
-    const regimeNodes = graphData.nodes.filter(n => n.type === 'MarketRegime');
+  const computeGraphPositions = (gData: typeof graphData, w: number) => {
+    const h = 280;
+    const stockNodes = gData.nodes.filter(n => n.type === 'Stock');
+    const signalNodes = gData.nodes.filter(n => n.type === 'Signal');
 
     const coords: Record<string, { x: number; y: number }> = {};
 
@@ -185,11 +254,11 @@ export default function App() {
     });
 
     // Orbit coordinates around their parent Stock
-    graphData.relationships.forEach((rel) => {
+    gData.relationships.forEach((rel) => {
       const sourcePt = coords[rel.source];
       if (!sourcePt) return;
 
-      const targetNode = graphData.nodes.find(n => n.id === rel.target);
+      const targetNode = gData.nodes.find(n => n.id === rel.target);
       if (!targetNode) return;
 
       if (!coords[targetNode.id]) {
@@ -197,18 +266,18 @@ export default function App() {
         if (targetNode.type === 'MarketRegime') {
           coords[targetNode.id] = {
             x: sourcePt.x,
-            y: sourcePt.y - 70 // Regime straight above
+            y: sourcePt.y - 75 // Regime straight above
           };
         } else {
           // Signals arranged in circular array around stock
           const sIndex = signalNodes.indexOf(targetNode);
           const angle = (sIndex * (360 / Math.max(1, signalNodes.length)) * Math.PI) / 180;
-          const radius = 60;
+          const radius = 65;
           coords[targetNode.id] = {
             x: sourcePt.x + radius * Math.cos(angle + (stockNodes.indexOf(
               stockNodes.find(s => s.id === rel.source) || stockNodes[0]
             ) * 45)),
-            y: sourcePt.y + radius * Math.sin(angle) * 0.9 + 15
+            y: sourcePt.y + radius * Math.sin(angle) * 0.95 + 15
           };
         }
       }
@@ -217,15 +286,45 @@ export default function App() {
     return coords;
   };
 
-  const positions = computeGraphPositions();
+  const getDisplayGraphData = () => {
+    if (!filterActiveOnly) {
+      return graphData;
+    }
+    const currentUpper = symbol.toUpperCase().trim();
+    const activeStockNode = graphData.nodes.find(
+      n => n.type === 'Stock' && n.properties.symbol === currentUpper
+    );
+    if (!activeStockNode) {
+      return { nodes: [], relationships: [] };
+    }
+    const activeRels = graphData.relationships.filter(
+      r => r.source === activeStockNode.id || r.target === activeStockNode.id
+    );
+    const activeNodeIds = new Set<string>();
+    activeNodeIds.add(activeStockNode.id);
+    activeRels.forEach(r => {
+      activeNodeIds.add(r.source);
+      activeNodeIds.add(r.target);
+    });
+    const activeNodes = graphData.nodes.filter(n => activeNodeIds.has(n.id));
+    return {
+      nodes: activeNodes,
+      relationships: activeRels
+    };
+  };
+
+  const displayGraphData = getDisplayGraphData();
+  const stockNodesCount = displayGraphData.nodes.filter(n => n.type === 'Stock').length;
+  const svgWidth = Math.max(620, stockNodesCount * 175);
+  const positions = computeGraphPositions(displayGraphData, svgWidth);
 
   // Helper colors for state machine steps
   const statesFlow = [
-    { key: "ACCUMULATION", label: "ACCUMULATION", desc: "主力震荡洗盘吸筹期 (吸筹)" },
-    { key: "BREAKOUT", label: "BREAKOUT", desc: "放量向上突破震荡阻力 (突破)" },
-    { key: "TREND_EXPANSION", label: "TREND EXPANSION", desc: "主升浪多头动能扩张 (多头)" },
-    { key: "DISTRIBUTION", label: "DISTRIBUTION", desc: "筹码高位松动派发出货 (派发)" },
-    { key: "DECLINE", label: "DECLINE", desc: "顺势向下调整跌破支撑 (衰退)" }
+    { key: "ACCUMULATION", label: "主力吸筹期 (ACCUMULATION)", desc: "主力震荡洗盘吸筹期 (吸筹)" },
+    { key: "BREAKOUT", label: "放量突破区 (BREAKOUT)", desc: "放量向上突破震荡阻力 (突破)" },
+    { key: "TREND_EXPANSION", label: "趋势主升浪 (TREND EXPANSION)", desc: "主升浪多头动能扩张 (多头)" },
+    { key: "DISTRIBUTION", label: "高位派发期 (DISTRIBUTION)", desc: "筹码高位松动派发出货 (派发)" },
+    { key: "DECLINE", label: "下行衰退期 (DECLINE)", desc: "顺势向下调整跌破支撑 (衰退)" }
   ];
 
   const getRegimeColor = (state: string) => {
@@ -261,7 +360,7 @@ export default function App() {
             <Cpu className="w-4 h-4 text-orange-100" />
           </div>
           <div>
-            <h1 className="text-sm font-bold tracking-wider text-neutral-100">INVESTMENT OS</h1>
+            <h1 className="text-sm font-bold tracking-wider text-neutral-100">量化投资时序研判系统</h1>
             <p className="text-[10px] font-mono text-neutral-500">量化内核决策操作系统 V1.0.0</p>
           </div>
         </div>
@@ -308,20 +407,21 @@ export default function App() {
 
             {/* 快速选择 */}
             <div className="space-y-1.5">
-              <label className="text-[10px] font-mono text-neutral-500 uppercase tracking-widest block font-medium">快捷切换标的</label>
-              <div className="grid grid-cols-4 gap-1.5">
-                {['AAPL', 'TSLA', 'NVDA', 'BTC'].map((sym) => (
+              <label className="text-[10px] font-mono text-neutral-500 uppercase tracking-widest block font-medium">快捷切换标的 (最近浏览)</label>
+              <div className="flex flex-wrap gap-1.5">
+                {recentStocks.map((item) => (
                   <button
-                    key={sym}
+                    key={item.symbol}
                     type="button"
-                    onClick={() => handleSymbolChange(sym)}
-                    className={`py-1.5 px-1 rounded text-xs font-mono font-medium transition-all border ${
-                      symbol.toUpperCase() === sym 
+                    onClick={() => handleSymbolChange(item.symbol)}
+                    className={`py-1 py-1.5 px-2.5 rounded text-[11px] font-sans font-medium transition-all border shrink-0 ${
+                      symbol.toUpperCase() === item.symbol.toUpperCase()
                         ? 'bg-orange-600/10 border-orange-500/50 text-orange-400' 
-                        : 'bg-neutral-950/60 border-neutral-900 text-neutral-400 hover:border-neutral-800'
+                        : 'bg-neutral-950/60 border-neutral-900 text-neutral-400 hover:border-neutral-800 hover:text-orange-300'
                     }`}
+                    title={`${item.symbol} - ${item.name}`}
                   >
-                    {sym}
+                    {item.name}
                   </button>
                 ))}
               </div>
@@ -330,13 +430,36 @@ export default function App() {
             {/* 输入代码 */}
             <div className="space-y-1.5">
               <label className="text-[10px] font-mono text-neutral-400 uppercase tracking-widest block font-medium">标的代码 (Symbol)</label>
-              <input
-                type="text"
-                value={symbol}
-                onChange={(e) => setSymbol(e.target.value.toUpperCase())}
-                placeholder="例如: MSFT"
-                className="w-full bg-neutral-950 border border-neutral-900 focus:border-orange-500/40 rounded px-3 py-2 text-sm font-mono text-orange-400 focus:outline-none transition-all"
-              />
+              <div className="flex space-x-1.5">
+                <input
+                  type="text"
+                  value={symbol}
+                  onChange={(e) => {
+                    const val = e.target.value.toUpperCase().trim();
+                    setSymbol(val);
+                    if (/^\d{6}$/.test(val) || /^(sh|sz|bj)\d{6}$/i.test(val)) {
+                      fetchBrokerData(val);
+                    }
+                  }}
+                  placeholder="例如: 600519"
+                  className="flex-1 bg-neutral-950 border border-neutral-900 focus:border-orange-500/40 rounded px-3 py-2 text-sm font-mono text-orange-400 focus:outline-none transition-all"
+                />
+                <button
+                  type="button"
+                  onClick={() => fetchBrokerData(symbol)}
+                  className="bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 text-xs text-neutral-300 px-3.5 py-2 rounded transition-all font-sans font-medium hover:text-orange-400 shrink-0"
+                  title="获取最新A股行情与资金流数据"
+                >
+                  同步行情
+                </button>
+              </div>
+              {stockName && (
+                <div className="flex items-center space-x-1.5 text-xs text-orange-400 bg-orange-950/20 px-2.5 py-1.5 rounded border border-orange-900/40 font-mono mt-1 w-full">
+                  <span className="w-1.5 h-1.5 rounded-full bg-orange-500 animate-pulse shrink-0" />
+                  <span className="text-neutral-400 text-[11px]">公司全称:</span>
+                  <span className="font-bold text-orange-400 text-[11px] truncate">{stockName}</span>
+                </div>
+              )}
             </div>
 
             {/* 意图 Prompt */}
@@ -466,14 +589,31 @@ export default function App() {
                 <Network className="w-4 h-4 text-orange-500" />
                 <h3 className="text-xs font-semibold uppercase tracking-wider text-neutral-300">持久化知识图谱时序网络 (KG)</h3>
               </div>
-              <span className="text-[10px] font-mono text-neutral-500 uppercase tracking-widest">关系数据库实时矩阵</span>
+              <div className="flex items-center space-x-3">
+                <label className="flex items-center space-x-1.5 cursor-pointer text-[10px] font-sans text-neutral-400 select-none hover:text-neutral-200 transition-colors bg-neutral-950/40 px-2 py-1 rounded border border-neutral-900">
+                  <input
+                    type="checkbox"
+                    checked={filterActiveOnly}
+                    onChange={(e) => setFilterActiveOnly(e.target.checked)}
+                    className="rounded border-neutral-800 bg-neutral-950 text-orange-600 focus:ring-0 focus:ring-offset-0 w-3 h-3 cursor-pointer"
+                  />
+                  <span>仅看当前标的</span>
+                </label>
+                <span className="text-[10px] font-mono text-neutral-500 uppercase tracking-widest hidden sm:inline">关系数据库实时矩阵</span>
+              </div>
             </div>
 
-            <div className="relative border border-neutral-950 rounded-lg bg-neutral-950/80 grow min-h-[300px] flex flex-col select-none overflow-hidden">
+            <div className="relative border border-neutral-950 rounded-lg bg-neutral-950/80 grow min-h-[320px] flex flex-col select-none overflow-x-auto overflow-y-hidden scrollbar-thin scrollbar-thumb-neutral-800 scrollbar-track-transparent">
               {/* 背景格栅 */}
-              <div className="absolute inset-0 z-0 opacity-10 bg-[linear-gradient(to_right,#808080_1px,transparent_1px),linear-gradient(to_bottom,#808080_1px,transparent_1px)] bg-[size:24px_24px]" />
+              <div 
+                className="absolute inset-0 z-0 opacity-10 bg-[linear-gradient(to_right,#808080_1px,transparent_1px),linear-gradient(to_bottom,#808080_1px,transparent_1px)] bg-[size:24px_24px]" 
+                style={{ width: `${svgWidth}px`, height: '100%' }}
+              />
               
-              <svg className="w-full h-full relative z-10" style={{ minHeight: '300px' }}>
+              <svg 
+                className="relative z-10 shrink-0" 
+                style={{ width: `${svgWidth}px`, height: '280px', minHeight: '280px' }}
+              >
                 <defs>
                   <marker id="arrow" viewBox="0 0 10 10" refX="18" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
                     <path d="M 0 2 L 10 5 L 0 8 z" fill="#3b82f6" opacity="0.6" />
@@ -483,8 +623,23 @@ export default function App() {
                   </marker>
                 </defs>
 
+                {/* 空状态温馨提示 */}
+                {displayGraphData.nodes.length === 0 && (
+                  <text
+                    x="50%"
+                    y="50%"
+                    textAnchor="middle"
+                    fill="#737373"
+                    fontSize="11px"
+                    fontFamily="monospace"
+                    className="select-none pointer-events-none"
+                  >
+                    未建立当前标的的拓扑网络。点击左下方“启动量化决策流水线”可生成！
+                  </text>
+                )}
+
                 {/* 拓扑连线 */}
-                {graphData.relationships.map((rel) => {
+                {displayGraphData.relationships.map((rel) => {
                   const source = positions[rel.source];
                   const target = positions[rel.target];
                   if (!source || !target) return null;
@@ -507,7 +662,7 @@ export default function App() {
                 })}
 
                 {/* 节点层渲染 */}
-                {graphData.nodes.map((node) => {
+                {displayGraphData.nodes.map((node) => {
                   const pos = positions[node.id];
                   if (!pos) return null;
 
@@ -566,7 +721,7 @@ export default function App() {
                         fontWeight={node.type === 'Stock' ? 'bold' : 'normal'}
                         className="pointer-events-none select-none drop-shadow text-center"
                       >
-                        {node.type === 'Stock' ? node.label : (node.properties.type || node.label.substring(0, 12))}
+                        {getLocalizedNodeLabel(node)}
                       </text>
                     </g>
                   );
@@ -603,14 +758,35 @@ export default function App() {
                         <span className="text-neutral-500">系统内部ID:</span> <span className="text-neutral-300">{selectedNode.id}</span>
                       </div>
                       <div>
-                        <span className="text-neutral-500">实体主要标签:</span> <span className="text-orange-400 font-semibold">{selectedNode.label}</span>
+                        <span className="text-neutral-500">实体主要标签:</span> <span className="text-orange-400 font-semibold">{getLocalizedNodeLabel(selectedNode)}</span>
                       </div>
-                      {Object.entries(selectedNode.properties || {}).map(([k, v]) => (
-                        <div key={k} className="col-span-2 border-t border-neutral-950/20 pt-1">
-                          <span className="text-neutral-500 uppercase">{k === 'symbol' ? '交易代号' : (k === 'state' ? '迁移阶段' : k === 'company_name' ? '公司中文名称' : k)}:</span>{' '}
-                          <span className="text-blue-300 whitespace-pre-wrap">{JSON.stringify(v)}</span>
-                        </div>
-                      ))}
+                      {Object.entries(selectedNode.properties || {}).map(([k, v]) => {
+                        let displayKey = k;
+                        let displayValue = typeof v === 'object' ? JSON.stringify(v) : String(v);
+
+                        if (k === 'symbol') displayKey = '交易代号';
+                        else if (k === 'state') {
+                          displayKey = '迁移阶段';
+                          displayValue = LOCALIZATION_MAP[v as string] || displayValue;
+                        } else if (k === 'company_name') displayKey = '公司中文名称';
+                        else if (k === 'timestamp') displayKey = '更新时间戳';
+                        else if (k === 'type') {
+                          displayKey = '信号特征分类';
+                          displayValue = LOCALIZATION_MAP[v as string] || displayValue;
+                        } else if (k === 'value') {
+                          displayKey = '评估监测值';
+                          displayValue = v === true ? '是 (触发)' : (v === false ? '否 (冷却)' : displayValue);
+                        } else if (k === 'historical_prices') displayKey = '历史时序价格样本';
+                        else if (k === 'historical_volumes') displayKey = '历史时序成交量样本';
+                        else if (k === 'time_window') displayKey = '回溯采样时间窗';
+
+                        return (
+                          <div key={k} className="col-span-2 border-t border-neutral-950/20 pt-1">
+                            <span className="text-neutral-500 uppercase">{displayKey}:</span>{' '}
+                            <span className="text-blue-300 whitespace-pre-wrap">{displayValue}</span>
+                          </div>
+                        );
+                      })}
                     </div>
                   </motion.div>
                 )}
