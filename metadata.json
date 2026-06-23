@@ -1,0 +1,6 @@
+{
+  "name": "Investment OS",
+  "description": "An AI-powered Investment Operating System with a Knowledge Graph, Market State Machine, and Multi-Agent Reasoning system.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
